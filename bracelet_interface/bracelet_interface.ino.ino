@@ -2,11 +2,17 @@
 #include <Arduino.h>
 #include <ESP8266WiFi.h>
 #include <ESP8266WiFiMulti.h>
+#include <WiFiUdp.h>
 #include <ESP8266HTTPClient.h>
 #include <ArduinoJson.h>
+#include <NTPClient.h>
 
-#define myID 1
-#define ACCLIMIT 3
+#define myID "0"
+#define URL "http://172.29.9.87:1323/info/"
+#define ACCLIMIT 2
+#define NTP_OFFSET   60 * 60      // In seconds
+#define NTP_INTERVAL 60 * 1000    // In miliseconds
+#define NTP_ADDRESS  "europe.pool.ntp.org"
 
 // MPU6050 Slave Device Address
 const uint8_t MPU6050SlaveAddress = 0x68;
@@ -30,102 +36,88 @@ const uint8_t MPU6050_REGISTER_ACCEL_XOUT_H =  0x3B;
 const uint8_t MPU6050_REGISTER_SIGNAL_PATH_RESET  = 0x68;
 
 ESP8266WiFiMulti WiFiMulti;
-int16_t AccelX, AccelY, AccelZ, Temperature, GyroX, GyroY, GyroZ;
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, NTP_ADDRESS, NTP_OFFSET, NTP_INTERVAL);
+int16_t AccelX, AccelY, AccelZ;
 StaticJsonBuffer<200> jsonBuffer; // 200 bytes
 JsonObject& root = jsonBuffer.createObject();
+double Ax, Ay, Az, A;
+unsigned long sum_tp, tp, last_time;
+bool fell;
+int httpCode;
 
 void setup() {
 
     Serial.begin(9600);
     Wire.begin(sda, scl);
     MPU6050_Init();
-    // Serial.setDebugOutput(true);
-
     WiFi.mode(WIFI_STA);
     WiFiMulti.addAP("Hack for Good", "hackforgood2018");
+    last_time = millis();
 }
 
 void loop() {
 
-    double Ax, Ay, Az, T, Gx, Gy, Gz, A;
-    unsigned long fall_time, regular_time;
-
     Read_RawValue(MPU6050SlaveAddress, MPU6050_REGISTER_ACCEL_XOUT_H);
-
     Ax = (double)AccelX/AccelScaleFactor;
     Ay = (double)AccelY/AccelScaleFactor;
     Az = (double)AccelZ/AccelScaleFactor;
-    Gx = (double)GyroX/GyroScaleFactor;
-    Gy = (double)GyroY/GyroScaleFactor;
-    Gz = (double)GyroZ/GyroScaleFactor;
 
     A = (double)sqrt(Ax * Ax + Ay * Ay + Az * Az);
-    fall_time += millis();
-    regular_time += millis();
+    tp = millis() - last_time;
+    last_time = millis();
+    Serial.print("A: "); Serial.println(A);
 
-    if(fall_time >= 10000) {
-        // Reset fall timer
-        fall_time = 0;
-        if (A >= ACCLIMIT){
-            // Reset regular timer
-            regular_time = 0;
-            // Define json
-            root["id"] = myID;
-            root["fell"] = true;
-            root["time"] = time_t now();
-            root["A_info"] = A;
-            root.prettyPrintTo(Serial);
-            // Send fall warning to server
-            HTTPClient http;
-            int httpCode;
-            if ((WiFiMulti.run() == WL_CONNECTED)) {
-                http.begin("http://172.16.0.37:1323/info");
-                httpCode = http.GET();
-                if (httpCode == HTTP_CODE_OK) {
-                    String jsonStr;
-                    root.printTo(jsonStr);
-                    httpCode = http.POST(jsonStr);
-                }
-                http.end();
-            } 
-        }
-    }
-
-    if(regular_time >= 30000) {
-        // Reset regular timer
-        regular_time = 0;
-        // Define json
-        root["id"] = myID;
-        root["fell"] = true;
-        root["time"] = time_t now();
-        root["A_info"] = A;
+    // Detects spike
+    if (A >= ACCLIMIT){
+        fell = true;
+        root["device"] = myID;
+        root["fell"] = fell;
+        root["time"] = "hardcoded";
+        //root["time"] = timeClient.getFormattedTime();
+        root["ainfo"] = A;
         root.prettyPrintTo(Serial);
-        // Send sensor information to server
-        HTTPClient http;
-        int httpCode;
-        if ((WiFiMulti.run() == WL_CONNECTED)) {
-            http.begin("http://172.16.0.37:1323/info");
-            httpCode = http.GET();
-            if (httpCode == HTTP_CODE_OK) {
-                String jsonStr;
-                root.printTo(jsonStr);
-                httpCode = http.POST(jsonStr);
-            }
-            http.end();
-        } 
+        httpCode = sendToServer(root);
+        if(httpCode != HTTP_CODE_OK || httpCode != HTTP_CODE_CREATED)
+          Serial.println("Error: Could not send http post");
+        sum_tp = 0;
     }
 
-    /*
-    Serial.print("Ax: "); Serial.print(Ax);
-    Serial.print(" Ay: "); Serial.print(Ay);
-    Serial.print(" Az: "); Serial.print(Az);
-    Serial.print(" T: "); Serial.print(T);
-    Serial.print(" Gx: "); Serial.print(Gx);
-    Serial.print(" Gy: "); Serial.print(Gy);
-    Serial.print(" Gz: "); Serial.println(Gz);
-    */
-        
-    delay(100);
+    if(sum_tp >= 30000) {
+        root["device"] = myID;
+        root["fell"] = fell;
+        root["time"] = "hardcoded";
+        //root["time"] = timeClient.getFormattedTime();
+        root["ainfo"] = A;
+        root.prettyPrintTo(Serial);
+        httpCode = sendToServer(root);
+        if(httpCode != HTTP_CODE_OK || httpCode != HTTP_CODE_CREATED)
+          Serial.println("Error: Could not send http post");
+        sum_tp = 0;
+    }
+
+   delay(1000);
+   Serial.println(tp);
+   sum_tp += tp;
+   Serial.println(sum_tp);
+   fell = false;
+}
+
+int sendToServer(JsonObject& root) {
+  HTTPClient http;
+  int httpCode;
+  String jsonStr;
+  String id(myID);
+  String url(URL);
+  if((WiFiMulti.run() == WL_CONNECTED)) {
+    Serial.println("Wifi Connected");
+    http.begin(url+id);
+    root.printTo(jsonStr);
+    http.addHeader("Content-Type", "application/json");
+    httpCode = http.POST(jsonStr);
+    http.end();
+  } 
+  return httpCode;
 }
 
 void I2C_Write(uint8_t deviceAddress, uint8_t regAddress, uint8_t data){
@@ -144,10 +136,6 @@ void Read_RawValue(uint8_t deviceAddress, uint8_t regAddress){
   AccelX = (((int16_t)Wire.read()<<8) | Wire.read());
   AccelY = (((int16_t)Wire.read()<<8) | Wire.read());
   AccelZ = (((int16_t)Wire.read()<<8) | Wire.read());
-  Temperature = (((int16_t)Wire.read()<<8) | Wire.read());
-  GyroX = (((int16_t)Wire.read()<<8) | Wire.read());
-  GyroY = (((int16_t)Wire.read()<<8) | Wire.read());
-  GyroZ = (((int16_t)Wire.read()<<8) | Wire.read());
 }
 
 //configure MPU6050
